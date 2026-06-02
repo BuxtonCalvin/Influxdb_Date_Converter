@@ -22,7 +22,7 @@ from typing import Any, cast
 
 import pandas as pd
 from influxdb import InfluxDBClient
-from influxdb.resultset import ResultSet
+from influxdb.resultset import InfluxDBClientError, ResultSet
 
 # --- CONFIGURATION ---
 #----------------------------------------------------------------------------------------------------------
@@ -32,7 +32,7 @@ from influxdb.resultset import ResultSet
 USE_INFLUX_OR_EG4_EXPORT = 'EG4'  # options: 'InfluxDB' or 'EG4'
 
 # Influxdb connect params
-HOST, PORT, USER, PASSWORD, DATABASE = 'xxx.xxx.xxx.xxx', 8086, 'User Name', 'Password', 'Database Name'
+HOST, PORT, USER, PASSWORD, DATABASE = 'xxx.xxx.xxx.xxx', 8086, 'User', 'PW', 'DB'
 
 # InfluxDB measurement name to write to (adjust as needed) ie:
 # if your InfluxDB schema has a measurement (Influxdb Folder) called "device_data" where you want to insert the data, set MEASUREMENT = 'device_data'.
@@ -42,13 +42,18 @@ MEASUREMENT = 'device_data'
 # extracted from the influxdb database by defaulting to UTC.  EG4 data is local time, so we apply the local timezone for the conversion to UTC.
 LOCAL_TIME_ZONE = 'America/Los_Angeles'
 
-SOURCE_START_TIME = '2026-03-09T06:09:15Z'  # Original start time in the source data (adjust as needed)
-SOURCE_END_TIME =   '2026-03-09T16:53:15Z'  # Original end time in the source data (adjust as needed) always greater or equal to start time
-TARGET_START_TIME = '2026-03-09T06:09:15Z'  # Desired start time for data to be inserted into InfluxDB (adjust as needed)
+# The time range in the source data that you want to import into InfluxDB.  This is used to calculate the time delta for shifting the timestamps.
+# year-month-day T hour:minute:second   (source data is in local time, but will be converted to UTC for the InfluxDB query engine)
+SOURCE_START_TIME = '2026-06-01T09:00:00'  # Original start time in the source data (adjust as needed) local time
+SOURCE_END_TIME =   '2026-06-01T14:00:00'  # Original end time in the source data (adjust as needed) always greater or equal to start time local time
+TARGET_START_TIME = '2026-06-01T09:00:00'  # Desired start time for data to be inserted into InfluxDB (adjust as needed)
 
 if pd.to_datetime(SOURCE_END_TIME) < pd.to_datetime(SOURCE_START_TIME):
     raise ValueError("SOURCE_END_TIME must be >= SOURCE_START_TIME")
 
+# Set to True to automatically convert integers to floats if InfluxDB encounters a type conflict.
+# Set to False to strictly throw an exception and reject type mismatches.
+ALLOW_FLOAT_COERCION = True
 
 # Static Tags to be added to every point.  Adjust values as needed, but keep the keys consistent with your InfluxDB schema.
 # If your CSV contains any of these columns, they will be ignored as fields and only the static tag value will be used.
@@ -74,7 +79,7 @@ BASE_PATH: Path = Path(__file__).parent
 IMPORT_MAP: Path = BASE_PATH / 'mapped_columns.csv'
 
 # Path to CSV file that contains the EG4 interface export data.
-EXPORT_FILE_FROM_EG4: Path = BASE_PATH / 'EG4_data.csv'
+EXPORT_FILE_FROM_EG4: Path = BASE_PATH / '2026-06-01.csv'
 
 # Output file for data exported from InfluxDB with the same time shifting logic applied.  This can be used to copy data from one measurement
 # to another within InfluxDB using the same mapping and time shifting logic.
@@ -348,7 +353,7 @@ def coerce_to_influx_type(field_name: str, value: Any, influx_types: dict[str, s
     - numeric codes that represent strings
     """
 
-    expected = influx_types.get(field_name)
+    expected: str | None = influx_types.get(field_name)
 
     if expected is None:
         return value
@@ -402,6 +407,7 @@ def check_field_type(field_name, value, influx_field_names):
 
     expected = influx_field_names[field_name]
 
+    # Change: Python integers are acceptable, but they MUST be cast to floats
     if expected == "float" and not isinstance(value, (int, float)):
         return False
 
@@ -436,7 +442,7 @@ def confirm_action(message: str) -> bool:
     Returns True if user confirms, False otherwise.
     """
     while True:
-        response = input(f"{message} [y/n]: ").strip().lower()
+        response: str = input(f"{message} [y/n]: ").strip().lower()
 
         if response in ("y", "yes"):
             return True
@@ -450,52 +456,60 @@ def confirm_action(message: str) -> bool:
 def delete_points_in_time_range() -> None:
     """
     Deletes points from InfluxDB in the specified time range for the given measurement.
-    This can be used to clear out any existing data in the target time range before re-importing corrected data.
+    Converts local configuration times to UTC before executing the query.
     """
-    query = f'DELETE FROM "{MEASUREMENT}" WHERE time >= \'{SOURCE_START_TIME}\' AND time < \'{SOURCE_END_TIME}\''  # noqa: S608
+    # Convert local user strings to true UTC for the InfluxDB query engine
+    start_utc = pd.to_datetime(SOURCE_START_TIME).tz_localize(LOCAL_TIME_ZONE).tz_convert("UTC").strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_utc = pd.to_datetime(SOURCE_END_TIME).tz_localize(LOCAL_TIME_ZONE).tz_convert("UTC").strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    query = f'DELETE FROM "{MEASUREMENT}" WHERE time >= \'{start_utc}\' AND time < \'{end_utc}\''  # noqa: S608
 
     print("\n⚠ WARNING: This operation will permanently delete data.")
     print(f"Measurement : {MEASUREMENT}")
-    print(f"Time range  : {SOURCE_START_TIME} → {SOURCE_END_TIME}\n")
+    print(f"Time range (Local) : {SOURCE_START_TIME} → {SOURCE_END_TIME}")
+    print(f"Time range (UTC)   : {start_utc} → {end_utc}\n")
 
     if not confirm_action("Proceed with deletion?"):
         print("Deletion cancelled by user.")
         sys.exit()
 
     InfluxClient.query(query)
-    print(f"Deleted points from {MEASUREMENT} between {SOURCE_START_TIME} and {SOURCE_END_TIME}")
+    print(f"Deleted points from {MEASUREMENT} between {SOURCE_START_TIME} and {SOURCE_END_TIME} (Local time equivalent).")
 
 def export_influx_data_to_csv() -> None:
     """
     Function to query data from InfluxDB, apply the same time shifting logic, and export to CSV.
-    This can be used to copy data from one measurement to another with the same mapping and time shifting logic.
     """
+    # Convert local user strings to true UTC for the InfluxDB selection filter
+    start_utc: str = pd.to_datetime(SOURCE_START_TIME).tz_localize(LOCAL_TIME_ZONE).tz_convert("UTC").strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_utc: str = pd.to_datetime(SOURCE_END_TIME).tz_localize(LOCAL_TIME_ZONE).tz_convert("UTC").strftime('%Y-%m-%dT%H:%M:%SZ')
 
     results: ResultSet = cast(
         ResultSet,
         InfluxClient.query(
             f'SELECT * FROM "{MEASUREMENT}" '  # noqa: S608
-            f'WHERE time >= \'{SOURCE_START_TIME}\' '
-            f'AND time < \'{SOURCE_END_TIME}\''
+            f'WHERE time >= \'{start_utc}\' '
+            f'AND time < \'{end_utc}\''
         )
     )
     points = list(results.get_points())
 
     if not points:
-        print("[INFO] No data found in InfluxDB for the specified measurement.")
+        print("[INFO] No data found in InfluxDB for the specified measurement time window.")
         return
 
-    # Calculate time delta for shifting the timestamps (same as before)
+    # Calculate time delta for shifting the timestamps using naive local times
     time_delta: pd.Timedelta = pd.to_datetime(TARGET_START_TIME) - pd.to_datetime(SOURCE_START_TIME)
 
     processed_rows = []
 
     for point in points:
-        # Convert InfluxDB time to pandas datetime
-        influx_time = pd.to_datetime(point['time'])
+        # InfluxDB returns UTC time. Convert it to user's Local Time first
+        influx_time_utc = pd.to_datetime(point['time']).tz_convert("UTC")
+        influx_time_local = influx_time_utc.tz_convert(LOCAL_TIME_ZONE).tz_localize(None)
 
-        # Shift time
-        new_time = (influx_time + time_delta).tz_localize(None)
+        # Shift local time by the user's delta configuration
+        new_time = influx_time_local + time_delta
 
         # Build a new row with mapped fields
         new_row = {'time': new_time.isoformat()}
@@ -503,7 +517,6 @@ def export_influx_data_to_csv() -> None:
         for field, value in point.items():
             if field in IGNORE_TAGS:
                 continue
-
             new_row[field] = value
 
         processed_rows.append(new_row)
@@ -513,6 +526,7 @@ def export_influx_data_to_csv() -> None:
     output_df.to_csv(EXPORT_FILE_FROM_INFLUX, index=False)
     print(f"Successfully exported {len(processed_rows)} rows to {EXPORT_FILE_FROM_INFLUX}")
 
+
 def write_csv_to_influx(export_file_name) -> None:
 
     df: pd.DataFrame = pd.read_csv(export_file_name)
@@ -520,15 +534,13 @@ def write_csv_to_influx(export_file_name) -> None:
     # Determine if we need to skip mapping
     is_influx_source_csv = (export_file_name == EXPORT_FILE_FROM_INFLUX)
 
-    # Calculate time delta for shifting the timestamps for the data being sent to influxdb. This will be coerced to each timestamp after converting to UTC.
+    # Calculate time delta for shifting the timestamps
     time_delta: pd.Timedelta = pd.to_datetime(TARGET_START_TIME) - pd.to_datetime(SOURCE_START_TIME)
     new_points = []
     missing_columns = set()
 
-
     for row in df.to_dict("records"):
 
-        # parse the timestamp of the source file inside the row loop, before the time shift is applied.
         time_val = row.get("Time") or row.get("time")
 
         if time_val is None:
@@ -537,15 +549,11 @@ def write_csv_to_influx(export_file_name) -> None:
         ts = pd.to_datetime(time_val)
 
         if USE_INFLUX_OR_EG4_EXPORT == "EG4":
-            # EG4 timestamps are local time → convert to UTC
+            ts = ts.tz_localize(LOCAL_TIME_ZONE, nonexistent="shift_forward").tz_convert("UTC")
+        else:
             ts = ts.tz_localize(LOCAL_TIME_ZONE, nonexistent="shift_forward").tz_convert("UTC")
 
-        else:
-            # Influx exports are already UTC
-            ts = ts.tz_localize("UTC")
-
         new_time = (ts + time_delta).tz_localize(None)
-
 
         # Build Fields and apply Mapping
         fields = {}
@@ -558,38 +566,45 @@ def write_csv_to_influx(export_file_name) -> None:
             if is_influx_source_csv:
                 target_field_name = str(col)
             else:
-                target_field_name = FIELD_MAPPER.get(str(col))
+                target_field_name: str | None = FIELD_MAPPER.get(str(col))
 
             if target_field_name is None:
                 missing_columns.add(col)
                 continue
 
             try:
-                val = normalize_value(val)
-
-                # Coerce to expected influx type
+                val: int | float | str | None = normalize_value(val)
                 val = coerce_to_influx_type(target_field_name, val, influx_fields)
             except (ValueError, TypeError):
                 pass
 
-            # skip empty values
             if val is None:
                 continue
 
-            # final type check
+            # === DYNAMIC LIVE SCHEMA COERCION ===
+            db_expected_type = influx_fields.get(target_field_name)
+
+            if db_expected_type == "float":
+                try:
+                    val = float(val)
+                except (ValueError, TypeError):
+                    continue
+
+            elif db_expected_type == "integer":
+                try:
+                    val = int(val)
+                except (ValueError, TypeError):
+                    continue
+            # ====================================
+
             if not check_field_type(target_field_name, val, influx_fields):
                 print(f"[WARN] Type mismatch for field '{target_field_name}', skipping value: {val}")
                 continue
-            # ----------------------
 
             fields[target_field_name] = val
 
         if not fields:
             continue
-
-        """ isna This function takes a scalar or array-like object and indicates
-        whether values are missing (``NaN`` in numeric arrays, ``None`` or ``NaN``
-        in object arrays, ``NaT`` in datetimelike)."""
 
         if pd.isna(new_time):
             continue
@@ -600,15 +615,41 @@ def write_csv_to_influx(export_file_name) -> None:
             'fields': fields,
             'tags': STATIC_TAGS
         })
+
     if missing_columns:
         print("[WARN] Unmapped CSV columns skipped:")
         for c in sorted(missing_columns):
             print(f"  - {c}")
 
     if new_points:
-        InfluxClient.write_points(new_points, batch_size=1000)
-        print(f"Successfully updated {len(new_points)} points.")
+        print(f"[INFO] Attempting to write {len(new_points)} points to InfluxDB...")
+        while True:
+            try:
+                InfluxClient.write_points(new_points, batch_size=1000)
+                print(f"Successfully updated {len(new_points)} points.")
+                break # Success! Exit the loop.
 
+            except InfluxDBClientError as e:
+                # Check if this is a field type conflict error
+                if ALLOW_FLOAT_COERCION and e.code == 400 and "field type conflict" in e.content:
+                    import re
+                    match: re.Match[str] | None = re.search(r'input field \\?"([^\\"]+)\\?"', e.content)
+
+                    if match:
+                        offending_field: str | Any = match.group(1)
+                        print(f"[FIX] Detected InfluxDB type conflict on field '{offending_field}'. Dynamically forcing to float and retrying...")
+
+                        for point in new_points:
+                            if 'fields' in point and offending_field in point['fields']:
+                                val = point['fields'][offending_field]
+                                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                                    point['fields'][offending_field] = float(val)
+
+                        continue  # Retry writing the corrected batch
+
+                # If ALLOW_FLOAT_COERCION is False, or it's a non-coercible 400 error, crash out safely
+                print(f"[ERROR] Database write failed. Coercion status: {ALLOW_FLOAT_COERCION}")
+                raise
     return
 
 # --- start execution ---
